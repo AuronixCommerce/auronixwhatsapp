@@ -23,6 +23,9 @@ let updatedAt = Date.now();
 let lastError = null;
 let initializing = false;
 
+const processedIncomingMessages = new Map();
+const DEDUPE_TTL_MS = 5 * 60 * 1000;
+
 function authorized(req) {
   const supplied = req.get('authorization') || '';
   return (
@@ -39,42 +42,6 @@ function normalizePhone(value) {
   return digits;
 }
 
-function tryNormalizePhone(value) {
-  try {
-    return normalizePhone(value);
-  } catch {
-    return null;
-  }
-}
-
-async function resolveSenderPhone(message) {
-  const candidates = [];
-
-  try {
-    const contact = await message.getContact();
-    if (contact) {
-      if (contact.number) candidates.push(contact.number);
-      if (contact.id && contact.id.user) candidates.push(contact.id.user);
-      if (contact.id && contact.id._serialized) candidates.push(contact.id._serialized.split('@')[0]);
-    }
-  } catch (error) {
-    console.warn(
-      '[Auronix WhatsApp] unable to resolve contact metadata',
-      error instanceof Error ? error.message : String(error)
-    );
-  }
-
-  if (message.author) candidates.push(String(message.author).split('@')[0]);
-  if (message.from) candidates.push(String(message.from).split('@')[0]);
-
-  for (const candidate of candidates) {
-    const phone = tryNormalizePhone(candidate);
-    if (phone) return phone;
-  }
-
-  throw new Error('Unable to resolve sender WhatsApp phone number');
-}
-
 function state() {
   return {
     success: true,
@@ -85,8 +52,49 @@ function state() {
     updatedAt,
     hasQr: Boolean(qr),
     lastError,
-    otpVerificationConfigured: Boolean(VERIFY_SECRET && VERIFY_URL),
+    verificationConfigured: Boolean(VERIFY_SECRET && VERIFY_URL),
   };
+}
+
+function pruneDedupe(now = Date.now()) {
+  for (const [id, timestamp] of processedIncomingMessages.entries()) {
+    if (now - timestamp > DEDUPE_TTL_MS) processedIncomingMessages.delete(id);
+  }
+}
+
+function markMessageOnce(messageId) {
+  const now = Date.now();
+  pruneDedupe(now);
+  if (processedIncomingMessages.has(messageId)) return false;
+  processedIncomingMessages.set(messageId, now);
+  return true;
+}
+
+async function resolveSenderPhone(message) {
+  const rawFrom = String(message && message.from || '');
+  const direct = rawFrom.split('@')[0].replace(/\D/g, '');
+  if (/^\d{8,15}$/.test(direct)) return direct;
+
+  try {
+    const contact = await message.getContact();
+    const candidates = [
+      contact && contact.number,
+      contact && contact.id && contact.id.user,
+      contact && contact.id && contact.id._serialized,
+    ];
+
+    for (const candidate of candidates) {
+      const digits = String(candidate || '').replace(/\D/g, '');
+      if (/^\d{8,15}$/.test(digits)) return digits;
+    }
+  } catch (error) {
+    console.warn(
+      '[Auronix WhatsApp] sender contact lookup failed',
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+
+  throw new Error(`Unable to resolve sender phone from WhatsApp ID type ${rawFrom.includes('@') ? rawFrom.split('@')[1] : 'unknown'}`);
 }
 
 const client = new Client({
@@ -130,10 +138,7 @@ client.on('ready', () => {
   updatedAt = Date.now();
   connectedNumber = client.info && client.info.wid ? client.info.wid.user : null;
   console.log('[Auronix WhatsApp] connected', connectedNumber || 'unknown');
-  console.log('[Auronix WhatsApp] seller OTP verification', VERIFY_SECRET && VERIFY_URL ? 'enabled' : 'DISABLED');
-  if (!VERIFY_SECRET) {
-    console.error('[Auronix WhatsApp] AURONIX_VERIFY_SECRET is missing from .env');
-  }
+  console.log('[Auronix WhatsApp] seller OTP verification enabled:', Boolean(VERIFY_SECRET && VERIFY_URL));
 });
 
 client.on('auth_failure', error => {
@@ -160,32 +165,35 @@ client.on('change_state', newState => {
   console.log('[Auronix WhatsApp] state', newState);
 });
 
-client.on('message', async message => {
+async function processIncomingOtpRequest(message, eventName) {
   try {
     if (!message || message.fromMe) return;
 
     const body = String(message.body || '').trim();
     if (!/^OTP$/i.test(body)) return;
 
+    const rawMessageId = message.id && message.id._serialized
+      ? String(message.id._serialized)
+      : `${String(message.from || 'unknown')}-${message.timestamp || Date.now()}`;
+
+    if (!markMessageOnce(rawMessageId)) {
+      console.log('[Auronix WhatsApp] duplicate OTP event ignored', { event: eventName });
+      return;
+    }
+
     console.log('[Auronix WhatsApp] incoming OTP request detected', {
-      senderType: String(message.from || '').split('@')[1] || 'unknown',
+      event: eventName,
+      idType: String(message.from || '').includes('@')
+        ? String(message.from || '').split('@')[1]
+        : 'unknown',
     });
 
     if (!VERIFY_SECRET || !VERIFY_URL) {
-      console.error('[Auronix WhatsApp] OTP request ignored because verification API is not configured');
-      try {
-        await client.sendMessage(
-          message.from,
-          'Auronix Commerce verification is temporarily unavailable. Please try again shortly.'
-        );
-      } catch {}
+      console.error('[Auronix WhatsApp] OTP verification is not configured');
       return;
     }
 
     const from = await resolveSenderPhone(message);
-    const messageId = message.id && message.id._serialized
-      ? message.id._serialized
-      : `${from}-${message.timestamp || Date.now()}`;
 
     console.log('[Auronix WhatsApp] forwarding OTP request to Auronix website', {
       fromLast4: from.slice(-4),
@@ -199,7 +207,7 @@ client.on('message', async message => {
       },
       body: JSON.stringify({
         from,
-        messageId,
+        messageId: rawMessageId,
         body: 'OTP',
       }),
       signal: AbortSignal.timeout(15000),
@@ -212,23 +220,21 @@ client.on('message', async message => {
         status: response.status,
         error: typeof result.error === 'string' ? result.error : 'unknown',
       });
-      try {
-        await client.sendMessage(
-          message.from,
-          'Auronix Commerce could not generate your verification code right now. Please return to the seller application and create a new verification request.'
-        );
-      } catch {}
       return;
     }
 
     if (result && typeof result.reply === 'string' && result.reply.trim()) {
       await client.sendMessage(message.from, result.reply.trim());
+      console.log('[Auronix WhatsApp] OTP reply sent', {
+        toLast4: from.slice(-4),
+      });
+    } else {
+      console.warn('[Auronix WhatsApp] verification API returned no WhatsApp reply');
     }
 
     console.log('[Auronix WhatsApp] seller OTP request processed', {
       fromLast4: from.slice(-4),
       otpIssued: result.otpIssued === true,
-      handled: result.handled === true,
     });
   } catch (error) {
     console.error(
@@ -236,6 +242,14 @@ client.on('message', async message => {
       error instanceof Error ? error.message : String(error)
     );
   }
+}
+
+client.on('message', message => {
+  processIncomingOtpRequest(message, 'message');
+});
+
+client.on('message_create', message => {
+  processIncomingOtpRequest(message, 'message_create');
 });
 
 app.get('/health', (req, res) => {
@@ -243,7 +257,9 @@ app.get('/health', (req, res) => {
     success: true,
     service: 'auronix-whatsapp-web',
     status,
-    otpVerificationConfigured: Boolean(VERIFY_SECRET && VERIFY_URL),
+    connected: status === 'connected',
+    connectedNumber,
+    verificationConfigured: Boolean(VERIFY_SECRET && VERIFY_URL),
     timestamp: Date.now(),
   });
 });
