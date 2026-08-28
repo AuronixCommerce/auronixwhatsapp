@@ -12,6 +12,7 @@ const PORT = Number(process.env.PORT || 5016);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.WHATSAPP_WORKER_SECRET || '';
 const VERIFY_SECRET = process.env.AURONIX_VERIFY_SECRET || '';
+const VERIFY_URL = process.env.AURONIX_VERIFY_URL || 'https://auronixcommerce.com/api/seller/whatsapp/inbound';
 const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH || '/opt/auronix-whatsapp-web/session';
 
 let status = 'starting';
@@ -118,6 +119,57 @@ client.on('change_state', newState => {
   console.log('[Auronix WhatsApp] state', newState);
 });
 
+client.on('message', async message => {
+  try {
+    if (!VERIFY_SECRET || !VERIFY_URL) return;
+    if (!message || message.fromMe) return;
+    if (!String(message.from || '').endsWith('@c.us')) return;
+
+    const body = String(message.body || '').trim();
+    if (!/^OTP$/i.test(body)) return;
+
+    const from = normalizePhone(String(message.from || '').split('@')[0]);
+    const messageId = message.id && message.id._serialized
+      ? message.id._serialized
+      : `${from}-${message.timestamp || Date.now()}`;
+
+    const response = await fetch(VERIFY_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${VERIFY_SECRET}`,
+      },
+      body: JSON.stringify({
+        from,
+        messageId,
+        body,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      console.error('[Auronix WhatsApp] OTP request API error', response.status);
+      return;
+    }
+
+    if (result && typeof result.reply === 'string' && result.reply.trim()) {
+      await client.sendMessage(message.from, result.reply.trim());
+    }
+
+    console.log('[Auronix WhatsApp] seller OTP request processed', {
+      fromLast4: from.slice(-4),
+      otpIssued: result.otpIssued === true,
+    });
+  } catch (error) {
+    console.error(
+      '[Auronix WhatsApp] seller OTP request failed',
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({
     success: true,
@@ -183,16 +235,7 @@ app.post('/send-otp', async (req, res) => {
     const sent = await client.sendMessage(chatId, messageText);
     const messageId = sent && sent.id && sent.id._serialized ? sent.id._serialized : null;
 
-    console.log('[Auronix WhatsApp] OTP sent', {
-      toLast4: phone.slice(-4),
-      messageId: messageId ? 'created' : 'unknown',
-    });
-
-    return res.json({
-      success: true,
-      sent: true,
-      messageId,
-    });
+    return res.json({ success: true, sent: true, messageId });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error('[Auronix WhatsApp] OTP send failed', message);
