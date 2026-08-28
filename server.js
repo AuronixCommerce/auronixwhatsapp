@@ -11,9 +11,8 @@ app.use(express.json({ limit: '64kb' }));
 const PORT = Number(process.env.PORT || 5016);
 const HOST = process.env.HOST || '0.0.0.0';
 const SECRET = process.env.WHATSAPP_WORKER_SECRET || '';
-const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH || '/opt/auronix-whatsapp-web/session';
-const VERIFY_URL = process.env.AURONIX_VERIFY_URL || 'https://auronixcommerce.com/api/seller/whatsapp/inbound';
 const VERIFY_SECRET = process.env.AURONIX_VERIFY_SECRET || '';
+const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH || '/opt/auronix-whatsapp-web/session';
 
 let status = 'starting';
 let qr = null;
@@ -24,7 +23,19 @@ let lastError = null;
 let initializing = false;
 
 function authorized(req) {
-  return Boolean(SECRET) && req.get('authorization') === `Bearer ${SECRET}`;
+  const supplied = req.get('authorization') || '';
+  return (
+    (Boolean(SECRET) && supplied === `Bearer ${SECRET}`) ||
+    (Boolean(VERIFY_SECRET) && supplied === `Bearer ${VERIFY_SECRET}`)
+  );
+}
+
+function normalizePhone(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (!/^\d{8,15}$/.test(digits)) {
+    throw new Error('Invalid WhatsApp phone number');
+  }
+  return digits;
 }
 
 function state() {
@@ -38,10 +49,6 @@ function state() {
     hasQr: Boolean(qr),
     lastError,
   };
-}
-
-function normalizeSender(value) {
-  return String(value || '').split('@')[0].replace(/\D/g, '');
 }
 
 const client = new Client({
@@ -111,57 +118,6 @@ client.on('change_state', newState => {
   console.log('[Auronix WhatsApp] state', newState);
 });
 
-client.on('message', async message => {
-  try {
-    if (!VERIFY_SECRET || !VERIFY_URL) return;
-    if (!message || message.fromMe) return;
-    if (!String(message.from || '').endsWith('@c.us')) return;
-
-    const body = String(message.body || '').trim();
-    if (!/^VERIFY\s+AURONIX\s+\d{6}$/i.test(body)) return;
-
-    const from = normalizeSender(message.from);
-    const messageId = message.id && message.id._serialized
-      ? message.id._serialized
-      : `${from}-${message.timestamp || Date.now()}`;
-
-    const response = await fetch(VERIFY_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${VERIFY_SECRET}`,
-      },
-      body: JSON.stringify({
-        from,
-        messageId,
-        body,
-      }),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    const result = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      console.error('[Auronix WhatsApp] verification API error', response.status);
-      return;
-    }
-
-    if (result && typeof result.reply === 'string' && result.reply.trim()) {
-      await client.sendMessage(message.from, result.reply.trim());
-    }
-
-    console.log('[Auronix WhatsApp] seller verification message processed', {
-      fromLast4: from.slice(-4),
-      verified: result.verified === true,
-    });
-  } catch (error) {
-    console.error(
-      '[Auronix WhatsApp] seller verification processing failed',
-      error instanceof Error ? error.message : String(error)
-    );
-  }
-});
-
 app.get('/health', (req, res) => {
   res.json({
     success: true,
@@ -183,6 +139,65 @@ app.get('/qr', (req, res) => {
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
   return res.json({ success: true, status, qr });
+});
+
+app.post('/send-otp', async (req, res) => {
+  if (!authorized(req)) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+
+  try {
+    if (status !== 'connected') {
+      return res.status(503).json({
+        success: false,
+        error: 'Auronix WhatsApp is not connected. Please reconnect the worker.',
+      });
+    }
+
+    const phone = normalizePhone(req.body && req.body.phone);
+    const code = String(req.body && req.body.code || '').trim();
+
+    if (!/^\d{6}$/.test(code)) {
+      return res.status(400).json({ success: false, error: 'Invalid OTP code' });
+    }
+
+    const chatId = `${phone}@c.us`;
+    const registered = await client.isRegisteredUser(chatId);
+
+    if (!registered) {
+      return res.status(400).json({
+        success: false,
+        error: 'That phone number is not registered on WhatsApp.',
+      });
+    }
+
+    const messageText = [
+      'Auronix Commerce seller verification',
+      '',
+      `Your one-time verification code is: ${code}`,
+      '',
+      'This code expires in 10 minutes.',
+      'Do not share this code with anyone.',
+    ].join('\n');
+
+    const sent = await client.sendMessage(chatId, messageText);
+    const messageId = sent && sent.id && sent.id._serialized ? sent.id._serialized : null;
+
+    console.log('[Auronix WhatsApp] OTP sent', {
+      toLast4: phone.slice(-4),
+      messageId: messageId ? 'created' : 'unknown',
+    });
+
+    return res.json({
+      success: true,
+      sent: true,
+      messageId,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[Auronix WhatsApp] OTP send failed', message);
+    return res.status(500).json({ success: false, error: message });
+  }
 });
 
 app.post('/initialize', async (req, res) => {
