@@ -71,31 +71,100 @@ function markMessageOnce(messageId) {
   return true;
 }
 
-async function resolveSenderPhone(message) {
-  const rawFrom = String(message && message.from || '');
-  const direct = rawFrom.split('@')[0].replace(/\D/g, '');
-  if (/^\d{8,15}$/.test(direct)) return direct;
+function whatsappId(value) {
+  if (value && typeof value === 'object' && value._serialized) {
+    return String(value._serialized);
+  }
+  return typeof value === 'string' ? value : '';
+}
+
+function phoneFromPnIdentity(value) {
+  const id = whatsappId(value);
+  const [user, server = ''] = id.split('@');
+  const digits = String(user || '').replace(/\D/g, '');
+  const isPhoneServer = ['c.us', 's.whatsapp.net', 'pn'].includes(server.toLowerCase());
+  return isPhoneServer && /^\d{8,15}$/.test(digits) ? digits : null;
+}
+
+function idType(value) {
+  const id = whatsappId(value);
+  return id.includes('@') ? id.split('@').pop() : 'unknown';
+}
+
+async function resolveLidWithClient(whatsappClient, lid) {
+  if (!lid.endsWith('@lid') || typeof whatsappClient.getContactLidAndPhone !== 'function') {
+    return null;
+  }
+
+  try {
+    const mappings = await whatsappClient.getContactLidAndPhone([lid]);
+    const phone = phoneFromPnIdentity(mappings && mappings[0] && mappings[0].pn);
+    if (phone) return phone;
+  } catch (error) {
+    console.warn('[Auronix WhatsApp] LID-to-phone lookup failed', {
+      idType: 'lid',
+      errorType: error instanceof Error ? error.name : 'unknown',
+    });
+  }
+
+  return null;
+}
+
+async function resolveSenderPhone(message, whatsappClient = client) {
+  const rawFrom = whatsappId(message && message.from);
+  const rawAuthor = whatsappId(message && message.author);
+  const metadataIds = [
+    rawAuthor,
+    rawFrom,
+    whatsappId(message && message.id && message.id.participant),
+    whatsappId(message && message.rawData && message.rawData.author),
+    whatsappId(message && message.rawData && message.rawData.id && message.rawData.id.participant),
+  ].filter(Boolean);
+
+  // A LID is an opaque WhatsApp identifier, not a phone number. Only trust
+  // identifiers explicitly marked as phone-number identities.
+  for (const candidate of metadataIds) {
+    const phone = phoneFromPnIdentity(candidate);
+    if (phone) return { phone, source: 'message-pn' };
+  }
+
+  for (const candidate of new Set(metadataIds.filter(id => id.endsWith('@lid')))) {
+    const phone = await resolveLidWithClient(whatsappClient, candidate);
+    if (phone) return { phone, source: 'lid-map' };
+  }
 
   try {
     const contact = await message.getContact();
-    const candidates = [
-      contact && contact.number,
-      contact && contact.id && contact.id.user,
-      contact && contact.id && contact.id._serialized,
-    ];
+    const contactId = whatsappId(contact && contact.id);
+    const directContactPhone = phoneFromPnIdentity(contactId);
+    if (directContactPhone) return { phone: directContactPhone, source: 'contact-pn' };
 
-    for (const candidate of candidates) {
-      const digits = String(candidate || '').replace(/\D/g, '');
-      if (/^\d{8,15}$/.test(digits)) return digits;
+    const mappedContactPhone = await resolveLidWithClient(whatsappClient, contactId);
+    if (mappedContactPhone) return { phone: mappedContactPhone, source: 'contact-lid-map' };
+
+    // In some WhatsApp Web builds the contact keeps a PN-backed `number`
+    // even when its ID is a LID. Only accept it when it differs from the LID.
+    const contactNumber = String(contact && contact.number || '').replace(/\D/g, '');
+    const lidDigits = contactId.endsWith('@lid') ? contactId.split('@')[0].replace(/\D/g, '') : '';
+    if (/^\d{8,15}$/.test(contactNumber) && contactNumber !== lidDigits) {
+      return { phone: contactNumber, source: 'contact-number' };
+    }
+
+    if (contact && typeof contact.getFormattedNumber === 'function') {
+      const formatted = String(await contact.getFormattedNumber() || '');
+      const formattedDigits = formatted.replace(/\D/g, '');
+      if (formatted.includes('+') && /^\d{8,15}$/.test(formattedDigits) && formattedDigits !== lidDigits) {
+        return { phone: formattedDigits, source: 'contact-formatted' };
+      }
     }
   } catch (error) {
     console.warn(
       '[Auronix WhatsApp] sender contact lookup failed',
-      error instanceof Error ? error.message : String(error)
+      { errorType: error instanceof Error ? error.name : 'unknown' }
     );
   }
 
-  throw new Error(`Unable to resolve sender phone from WhatsApp ID type ${rawFrom.includes('@') ? rawFrom.split('@')[1] : 'unknown'}`);
+  throw new Error(`Unable to resolve sender phone from WhatsApp ID type ${idType(rawAuthor || rawFrom)}`);
 }
 
 const client = new Client({
@@ -147,7 +216,9 @@ client.on('ready', () => {
   connectedAt = connectedAt || Date.now();
   updatedAt = Date.now();
   connectedNumber = client.info && client.info.wid ? client.info.wid.user : null;
-  console.log('[Auronix WhatsApp] connected', connectedNumber || 'unknown');
+  console.log('[Auronix WhatsApp] connected', {
+    numberLast4: connectedNumber ? connectedNumber.slice(-4) : 'unknown',
+  });
   console.log('[Auronix WhatsApp] seller OTP verification enabled:', Boolean(VERIFY_SECRET && VERIFY_URL));
 });
 
@@ -203,10 +274,12 @@ async function processIncomingOtpRequest(message, eventName) {
       return;
     }
 
-    const from = await resolveSenderPhone(message);
+    const resolvedSender = await resolveSenderPhone(message);
+    const from = resolvedSender.phone;
 
     console.log('[Auronix WhatsApp] forwarding OTP request to Auronix website', {
       fromLast4: from.slice(-4),
+      resolution: resolvedSender.source,
     });
 
     const response = await fetch(VERIFY_URL, {
@@ -383,17 +456,25 @@ app.post('/logout', async (req, res) => {
   }
 });
 
-app.listen(PORT, HOST, () => {
-  console.log(`[Auronix WhatsApp] worker listening on ${HOST}:${PORT}`);
-  console.log(`[Auronix WhatsApp] session path: ${SESSION_PATH}`);
-  console.log(`[Auronix WhatsApp] Chrome path: ${CHROME_PATH}`);
-  console.log(`[Auronix WhatsApp] verification API: ${VERIFY_URL}`);
-  console.log(`[Auronix WhatsApp] verification secret configured: ${Boolean(VERIFY_SECRET)}`);
+if (require.main === module) {
+  app.listen(PORT, HOST, () => {
+    console.log(`[Auronix WhatsApp] worker listening on ${HOST}:${PORT}`);
+    console.log(`[Auronix WhatsApp] session path: ${SESSION_PATH}`);
+    console.log(`[Auronix WhatsApp] Chrome path: ${CHROME_PATH}`);
+    console.log(`[Auronix WhatsApp] verification API: ${VERIFY_URL}`);
+    console.log(`[Auronix WhatsApp] verification secret configured: ${Boolean(VERIFY_SECRET)}`);
 
-  client.initialize().catch(error => {
-    status = 'initialization_failed';
-    lastError = error instanceof Error ? error.message : String(error);
-    updatedAt = Date.now();
-    console.error('[Auronix WhatsApp] initial initialization failed', error);
+    client.initialize().catch(error => {
+      status = 'initialization_failed';
+      lastError = error instanceof Error ? error.message : String(error);
+      updatedAt = Date.now();
+      console.error('[Auronix WhatsApp] initial initialization failed', error);
+    });
   });
-});
+}
+
+module.exports = {
+  idType,
+  phoneFromPnIdentity,
+  resolveSenderPhone,
+};
