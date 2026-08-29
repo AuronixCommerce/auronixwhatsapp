@@ -14,6 +14,7 @@ const SECRET = process.env.WHATSAPP_WORKER_SECRET || '';
 const VERIFY_SECRET = process.env.AURONIX_VERIFY_SECRET || '';
 const VERIFY_URL = process.env.AURONIX_VERIFY_URL || 'https://auronixcommerce.com/api/seller/whatsapp/inbound';
 const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH || '/opt/auronix-whatsapp-web/session';
+const CHROME_PATH = process.env.CHROME_PATH || '/root/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome';
 
 let status = 'starting';
 let qr = null;
@@ -104,10 +105,19 @@ const client = new Client({
   }),
   puppeteer: {
     headless: true,
+    executablePath: CHROME_PATH,
+    timeout: 120000,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding',
+      '--no-first-run',
+      '--no-default-browser-check',
     ],
   },
 });
@@ -376,6 +386,7 @@ app.post('/logout', async (req, res) => {
 app.listen(PORT, HOST, () => {
   console.log(`[Auronix WhatsApp] worker listening on ${HOST}:${PORT}`);
   console.log(`[Auronix WhatsApp] session path: ${SESSION_PATH}`);
+  console.log(`[Auronix WhatsApp] Chrome path: ${CHROME_PATH}`);
   console.log(`[Auronix WhatsApp] verification API: ${VERIFY_URL}`);
   console.log(`[Auronix WhatsApp] verification secret configured: ${Boolean(VERIFY_SECRET)}`);
 
