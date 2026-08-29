@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const { createInitializationController } = require('./startup');
 
 const app = express();
 app.disable('x-powered-by');
@@ -22,7 +23,6 @@ let connectedNumber = null;
 let connectedAt = null;
 let updatedAt = Date.now();
 let lastError = null;
-let initializing = false;
 
 const processedIncomingMessages = new Map();
 const DEDUPE_TTL_MS = 5 * 60 * 1000;
@@ -252,6 +252,37 @@ client.on('change_state', newState => {
   console.log('[Auronix WhatsApp] state', newState);
 });
 
+const initialization = createInitializationController(
+  () => client.initialize(),
+  {
+    onStart: ({ attempt, trigger }) => {
+      status = 'starting';
+      lastError = null;
+      updatedAt = Date.now();
+      console.log('[Auronix WhatsApp] initialization started', { attempt, trigger });
+    },
+    onJoin: ({ attempt, trigger }) => {
+      console.warn('[Auronix WhatsApp] initialization already active; joining it', {
+        attempt,
+        trigger,
+      });
+    },
+    onFailure: ({ attempt, trigger, error }) => {
+      status = 'initialization_failed';
+      lastError = error instanceof Error ? error.message : String(error);
+      updatedAt = Date.now();
+      console.error('[Auronix WhatsApp] initialization failed', {
+        attempt,
+        trigger,
+        errorType: error instanceof Error ? error.name : 'unknown',
+        message: lastError,
+        browserConnected: client.pupBrowser?.isConnected?.() ?? false,
+        pageClosed: client.pupPage?.isClosed?.() ?? true,
+      });
+    },
+  }
+);
+
 client.on('loading_screen', (percent, message) => {
   status = 'loading';
   updatedAt = Date.now();
@@ -355,6 +386,8 @@ app.get('/health', (req, res) => {
     connected: status === 'connected',
     connectedNumber,
     verificationConfigured: Boolean(VERIFY_SECRET && VERIFY_URL),
+    initializing: initialization.isInitializing(),
+    initializationAttempt: initialization.getAttempt(),
     timestamp: Date.now(),
   });
 });
@@ -428,21 +461,15 @@ app.post('/initialize', async (req, res) => {
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
 
-  if (initializing) {
+  if (initialization.isInitializing()) {
     return res.json({ success: true, status, initializing: true });
   }
 
-  initializing = true;
   try {
-    await client.initialize();
+    await initialization.run('endpoint');
     return res.json({ success: true, status });
   } catch (error) {
-    status = 'initialization_failed';
-    lastError = error instanceof Error ? error.message : String(error);
-    updatedAt = Date.now();
     return res.status(500).json({ success: false, error: lastError });
-  } finally {
-    initializing = false;
   }
 });
 
@@ -477,11 +504,8 @@ if (require.main === module) {
     console.log(`[Auronix WhatsApp] verification API: ${VERIFY_URL}`);
     console.log(`[Auronix WhatsApp] verification secret configured: ${Boolean(VERIFY_SECRET)}`);
 
-    client.initialize().catch(error => {
-      status = 'initialization_failed';
-      lastError = error instanceof Error ? error.message : String(error);
-      updatedAt = Date.now();
-      console.error('[Auronix WhatsApp] initial initialization failed', error);
+    initialization.run('startup').catch(() => {
+      // The controller records a sanitized, structured failure above.
     });
   });
 }
