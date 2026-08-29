@@ -172,6 +172,12 @@ const client = new Client({
     clientId: 'auronix-commerce',
     dataPath: SESSION_PATH,
   }),
+  // Do not replay a pinned WhatsApp Web HTML shell from .wwebjs_cache. The
+  // saved LocalAuth browser profile is separate and remains fully preserved.
+  webVersionCache: {
+    type: 'none',
+  },
+  authTimeoutMs: 120000,
   puppeteer: {
     headless: true,
     executablePath: CHROME_PATH,
@@ -244,6 +250,12 @@ client.on('disconnected', reason => {
 client.on('change_state', newState => {
   updatedAt = Date.now();
   console.log('[Auronix WhatsApp] state', newState);
+});
+
+client.on('loading_screen', (percent, message) => {
+  status = 'loading';
+  updatedAt = Date.now();
+  console.log('[Auronix WhatsApp] loading', { percent, message });
 });
 
 async function processIncomingOtpRequest(message, eventName) {
@@ -461,6 +473,7 @@ if (require.main === module) {
     console.log(`[Auronix WhatsApp] worker listening on ${HOST}:${PORT}`);
     console.log(`[Auronix WhatsApp] session path: ${SESSION_PATH}`);
     console.log(`[Auronix WhatsApp] Chrome path: ${CHROME_PATH}`);
+    console.log('[Auronix WhatsApp] web version cache: disabled');
     console.log(`[Auronix WhatsApp] verification API: ${VERIFY_URL}`);
     console.log(`[Auronix WhatsApp] verification secret configured: ${Boolean(VERIFY_SECRET)}`);
 
